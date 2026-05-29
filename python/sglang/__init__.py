@@ -31,6 +31,20 @@ from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patc
 _apply_hf_patches()
 del _apply_hf_patches
 
+import os as _os
+
+if _os.getenv("SGLANG_ENABLE_MODES", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    from sglang.srt.layers.moe.modes import install_modes_patches as _install_modes
+
+    _install_modes()
+    del _install_modes
+del _os
+
 # Frontend Language APIs
 from sglang.global_config import global_config
 from sglang.lang.api import (
