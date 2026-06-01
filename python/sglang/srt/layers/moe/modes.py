@@ -170,9 +170,10 @@ def apply_modes_to_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply MoDES masking to routed expert slots.
 
-    A route is skipped when ``topk_weight * alpha[layer_id] < tau_text``. Skipped
-    routes get weight 0 and expert id -1, matching SGLang's padded-token route
-    convention.
+    A route is masked when ``topk_weight * alpha[layer_id] < tau_text``. Masked
+    routes get weight 0 while keeping their original expert id. Keeping expert
+    ids valid avoids Triton fused-MoE kernels that do not accept ``-1`` in
+    active routed slots.
     """
 
     config = get_modes_runtime_config()
@@ -194,11 +195,7 @@ def apply_modes_to_topk(
         skip_mask, scores, valid_mask, config.min_experts_per_token
     )
 
-    routed_weights = routed_weights.masked_fill(skip_mask, 0.0)
-    routed_ids = routed_ids.masked_fill(skip_mask, -1)
-
     topk_weights = topk_weights.clone()
     topk_ids = topk_ids.clone()
-    topk_weights[:, :routed_cols] = routed_weights
-    topk_ids[:, :routed_cols] = routed_ids
+    topk_weights[:, :routed_cols] = routed_weights.masked_fill(skip_mask, 0.0)
     return topk_weights, topk_ids
