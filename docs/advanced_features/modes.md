@@ -37,17 +37,17 @@ score = topk_weight * alpha[layer_id]
 skip  = score < modes_tau_text
 ```
 
-Skipped slots are written as:
+Masked slots are written as:
 
 ```text
 topk_weight = 0
-topk_id = -1
+topk_id = original expert id
 ```
 
-`topk_id = -1` follows SGLang's existing padded-route convention. The
-integration is only applied to standard top-k outputs. When MoDES is enabled,
-SGLang forces standard top-k by default so the mask can be applied outside fused
-top-k kernels.
+The expert id is intentionally kept valid because the Triton fused-MoE path does
+not accept `-1` inside active routed slots. The integration is only applied to
+standard top-k outputs. When MoDES is enabled, SGLang forces standard top-k by
+default so the mask can be applied outside fused top-k kernels.
 
 Set `SGLANG_MODES_FORCE_STANDARD_TOPK=0` to disable this behavior.
 
@@ -55,8 +55,9 @@ Set `SGLANG_MODES_FORCE_STANDARD_TOPK=0` to disable this behavior.
 
 - Text-only thresholding. Vision/text token-specific thresholds are not wired
   into `ForwardBatch` yet.
-- Experimental route masking only. It should be benchmarked with the selected
-  MoE runner to verify that skipped routes reduce actual expert compute.
+- Experimental route masking only. It masks routed contribution by zeroing
+  weights. Turning masked routes into actual compute skips requires runner or
+  kernel support for dropping routed slots before fused expert execution.
 - Not intended for `triton_kernel` or bypassed fused-top-k backends in this
   first version. Use `--moe-runner-backend triton` for the initial benchmark.
 - CUDA graph compatibility has not been validated.
