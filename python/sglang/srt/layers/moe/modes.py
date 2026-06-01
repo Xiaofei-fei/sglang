@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
@@ -26,9 +28,14 @@ logger = logging.getLogger(__name__)
 class ModesRuntimeConfig:
     enabled: bool
     alpha_path: Optional[str]
-    tau_text: float
+    tau_text: Optional[float]
+    auto_tau: bool
+    target_skip_rate: float
+    calibration_routes: int
     min_experts_per_token: int
     force_standard_topk: bool
+    metrics_path: Optional[str]
+    metrics_flush_interval: int
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -38,16 +45,41 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float_optional(name: str) -> Optional[float]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
 @lru_cache(maxsize=1)
 def get_modes_runtime_config() -> ModesRuntimeConfig:
+    tau_text = _env_float_optional("SGLANG_MODES_TAU_TEXT")
     return ModesRuntimeConfig(
         enabled=_env_bool("SGLANG_ENABLE_MODES", False),
         alpha_path=os.getenv("SGLANG_MODES_ALPHA_PATH"),
-        tau_text=float(os.getenv("SGLANG_MODES_TAU_TEXT", "0") or 0.0),
+        tau_text=tau_text,
+        auto_tau=_env_bool("SGLANG_MODES_AUTO_TAU", tau_text is None),
+        target_skip_rate=_clamp(
+            float(os.getenv("SGLANG_MODES_TARGET_SKIP_RATE", "0.13") or 0.13),
+            0.0,
+            1.0,
+        ),
+        calibration_routes=max(
+            1, int(os.getenv("SGLANG_MODES_CALIBRATION_ROUTES", "500000") or 500000)
+        ),
         min_experts_per_token=max(
             0, int(os.getenv("SGLANG_MODES_MIN_EXPERTS_PER_TOKEN", "0") or 0)
         ),
         force_standard_topk=_env_bool("SGLANG_MODES_FORCE_STANDARD_TOPK", True),
+        metrics_path=os.getenv("SGLANG_MODES_METRICS_PATH"),
+        metrics_flush_interval=max(
+            1, int(os.getenv("SGLANG_MODES_METRICS_FLUSH_INTERVAL", "100") or 100)
+        ),
     )
 
 
@@ -134,6 +166,147 @@ def _alpha_for_layer(layer_id: Optional[int], alpha_path: Optional[str]) -> floa
     return alpha[layer_id]
 
 
+def _atomic_write_json(path: str, obj: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".modes-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class _ModesRuntimeState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.score_chunks: list[torch.Tensor] = []
+        self.calibration_route_count = 0
+        self.calibrated_tau_text: Optional[float] = None
+        self.calls = 0
+        self.route_count = 0
+        self.skip_count = 0
+        self.active_route_count = 0
+        self.active_skip_count = 0
+
+    def effective_tau_text(self, config: ModesRuntimeConfig) -> Optional[float]:
+        if config.tau_text is not None and config.tau_text > 0.0:
+            return config.tau_text
+        if not config.auto_tau:
+            return None
+        with self.lock:
+            return self.calibrated_tau_text
+
+    def observe_scores_for_auto_tau(
+        self, scores: torch.Tensor, config: ModesRuntimeConfig
+    ) -> None:
+        if config.tau_text is not None or not config.auto_tau:
+            return
+        if scores.numel() == 0:
+            return
+
+        score_chunk = scores.detach().float().flatten().cpu()
+        with self.lock:
+            if self.calibrated_tau_text is not None:
+                return
+            remaining = config.calibration_routes - self.calibration_route_count
+            if remaining <= 0:
+                return
+
+            if score_chunk.numel() > remaining:
+                score_chunk = score_chunk[:remaining]
+            self.score_chunks.append(score_chunk)
+            self.calibration_route_count += int(score_chunk.numel())
+
+            if self.calibration_route_count < config.calibration_routes:
+                return
+
+            all_scores = torch.cat(self.score_chunks)
+            if config.target_skip_rate <= 0.0:
+                tau_text = 0.0
+            elif config.target_skip_rate >= 1.0:
+                tau_text = float(all_scores.max().item())
+            else:
+                tau_text = float(
+                    torch.quantile(all_scores, config.target_skip_rate).item()
+                )
+            self.calibrated_tau_text = tau_text
+            self.score_chunks.clear()
+
+        logger.info(
+            "MoDES auto-calibrated tau_text=%s from %s routed scores "
+            "for target_skip_rate=%s.",
+            tau_text,
+            config.calibration_routes,
+            config.target_skip_rate,
+        )
+        self.maybe_write_metrics(config, force=True)
+
+    def record_routes(
+        self,
+        route_count: int,
+        skip_count: int,
+        config: ModesRuntimeConfig,
+        *,
+        masking_active: bool,
+    ) -> None:
+        with self.lock:
+            self.calls += 1
+            self.route_count += route_count
+            self.skip_count += skip_count
+            if masking_active:
+                self.active_route_count += route_count
+                self.active_skip_count += skip_count
+            should_flush = self.calls % config.metrics_flush_interval == 0
+        if should_flush:
+            self.maybe_write_metrics(config)
+
+    def maybe_write_metrics(
+        self, config: ModesRuntimeConfig, *, force: bool = False
+    ) -> None:
+        if not config.metrics_path:
+            return
+        with self.lock:
+            route_count = self.route_count
+            skip_count = self.skip_count
+            active_route_count = self.active_route_count
+            active_skip_count = self.active_skip_count
+            obj = {
+                "active_route_count": active_route_count,
+                "active_skip_count": active_skip_count,
+                "active_skip_rate": active_skip_count / active_route_count
+                if active_route_count
+                else 0.0,
+                "auto_tau": config.auto_tau and config.tau_text is None,
+                "calibrated": self.calibrated_tau_text is not None
+                or (config.tau_text is not None and config.tau_text > 0.0),
+                "calibration_route_count": self.calibration_route_count,
+                "calibration_routes": config.calibration_routes,
+                "calls": self.calls,
+                "configured_tau_text": config.tau_text,
+                "effective_tau_text": self.calibrated_tau_text
+                if config.tau_text is None
+                else config.tau_text,
+                "route_count": route_count,
+                "skip_count": skip_count,
+                "skip_rate": skip_count / route_count if route_count else 0.0,
+                "target_skip_rate": config.target_skip_rate,
+            }
+
+        try:
+            _atomic_write_json(config.metrics_path, obj)
+        except Exception:
+            logger.exception("Failed to write MoDES metrics to %s", config.metrics_path)
+
+
+_MODES_STATE = _ModesRuntimeState()
+
+
 def _protect_min_experts(
     skip_mask: torch.Tensor,
     scores: torch.Tensor,
@@ -177,7 +350,7 @@ def apply_modes_to_topk(
     """
 
     config = get_modes_runtime_config()
-    if not config.enabled or config.tau_text <= 0.0 or topk_weights.numel() == 0:
+    if not config.enabled or topk_weights.numel() == 0:
         return topk_weights, topk_ids
 
     routed_cols = topk_weights.shape[1] - max(0, num_fused_shared_experts)
@@ -190,10 +363,28 @@ def apply_modes_to_topk(
 
     scores = routed_weights.float() * alpha
     valid_mask = routed_ids >= 0
-    skip_mask = (scores < config.tau_text) & valid_mask
+    valid_scores = scores[valid_mask]
+    tau_text = _MODES_STATE.effective_tau_text(config)
+
+    if tau_text is None or tau_text <= 0.0:
+        _MODES_STATE.observe_scores_for_auto_tau(valid_scores, config)
+        if config.metrics_path:
+            _MODES_STATE.record_routes(
+                int(valid_mask.sum().item()), 0, config, masking_active=False
+            )
+        return topk_weights, topk_ids
+
+    skip_mask = (scores < tau_text) & valid_mask
     skip_mask = _protect_min_experts(
         skip_mask, scores, valid_mask, config.min_experts_per_token
     )
+    if config.metrics_path:
+        _MODES_STATE.record_routes(
+            int(valid_mask.sum().item()),
+            int(skip_mask.sum().item()),
+            config,
+            masking_active=True,
+        )
 
     topk_weights = topk_weights.clone()
     topk_ids = topk_ids.clone()
