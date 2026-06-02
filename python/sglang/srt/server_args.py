@@ -650,6 +650,23 @@ class ServerArgs:
     enable_deepep_waterfill: bool = False
     elastic_ep_rejoin: bool = False
 
+    # Experimental MoDES route masking for MoE models
+    enable_modes: bool = False
+    modes_config: Optional[str] = None
+    modes_save_config: Optional[str] = None
+    modes_alpha_path: Optional[str] = None
+    modes_tau_text: Optional[float] = None
+    modes_target_skip_rate: Optional[float] = None
+    modes_calibration_routes: Optional[int] = None
+    modes_min_experts_per_token: Optional[int] = None
+    modes_metrics_path: Optional[str] = None
+    modes_metrics_flush_interval: Optional[int] = None
+    modes_alpha_min: Optional[float] = None
+    modes_alpha_max: Optional[float] = None
+    modes_disable_auto_alpha: bool = False
+    modes_disable_auto_tau: bool = False
+    modes_disable_force_standard_topk: bool = False
+
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
@@ -893,6 +910,11 @@ class ServerArgs:
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
+
+        # Configure experimental MoDES route masking before model modules are
+        # constructed. This keeps the CLI path equivalent to setting the
+        # SGLANG_MODES_* environment variables before importing SGLang.
+        self._handle_modes_integration()
 
         # Resolve --quantization unquant: explicitly opt out of quantization.
         # Convert to None now (before model config validation), but record
@@ -1164,6 +1186,71 @@ class ServerArgs:
             self.prefill_delayer_max_delay_passes = x
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
+
+    def _handle_modes_integration(self):
+        def set_env(name: str, value: Any):
+            if value is not None:
+                os.environ[name] = str(value)
+
+        modes_requested = self.enable_modes or any(
+            value is not None
+            for value in (
+                self.modes_config,
+                self.modes_save_config,
+                self.modes_alpha_path,
+                self.modes_tau_text,
+                self.modes_target_skip_rate,
+                self.modes_calibration_routes,
+                self.modes_min_experts_per_token,
+                self.modes_metrics_path,
+                self.modes_metrics_flush_interval,
+                self.modes_alpha_min,
+                self.modes_alpha_max,
+            )
+        )
+        modes_requested = (
+            modes_requested
+            or self.modes_disable_auto_alpha
+            or self.modes_disable_auto_tau
+            or self.modes_disable_force_standard_topk
+        )
+
+        if modes_requested:
+            os.environ["SGLANG_ENABLE_MODES"] = "1"
+
+        set_env("SGLANG_MODES_CONFIG", self.modes_config)
+        set_env("SGLANG_MODES_SAVE_CONFIG", self.modes_save_config)
+        set_env("SGLANG_MODES_ALPHA_PATH", self.modes_alpha_path)
+        set_env("SGLANG_MODES_TAU_TEXT", self.modes_tau_text)
+        set_env("SGLANG_MODES_TARGET_SKIP_RATE", self.modes_target_skip_rate)
+        set_env("SGLANG_MODES_CALIBRATION_ROUTES", self.modes_calibration_routes)
+        set_env(
+            "SGLANG_MODES_MIN_EXPERTS_PER_TOKEN", self.modes_min_experts_per_token
+        )
+        set_env("SGLANG_MODES_METRICS_PATH", self.modes_metrics_path)
+        set_env(
+            "SGLANG_MODES_METRICS_FLUSH_INTERVAL",
+            self.modes_metrics_flush_interval,
+        )
+        set_env("SGLANG_MODES_ALPHA_MIN", self.modes_alpha_min)
+        set_env("SGLANG_MODES_ALPHA_MAX", self.modes_alpha_max)
+
+        if self.modes_disable_auto_alpha:
+            os.environ["SGLANG_MODES_AUTO_ALPHA"] = "0"
+        if self.modes_disable_auto_tau:
+            os.environ["SGLANG_MODES_AUTO_TAU"] = "0"
+        if self.modes_disable_force_standard_topk:
+            os.environ["SGLANG_MODES_FORCE_STANDARD_TOPK"] = "0"
+
+        if os.getenv("SGLANG_ENABLE_MODES", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            from sglang.srt.layers.moe.modes import install_modes_patches
+
+            install_modes_patches()
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -5965,6 +6052,98 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.elastic_ep_rejoin,
             help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+        )
+
+        # Experimental MoDES route masking
+        parser.add_argument(
+            "--enable-modes",
+            action="store_true",
+            default=ServerArgs.enable_modes,
+            help="Enable experimental MoDES route masking for MoE models.",
+        )
+        parser.add_argument(
+            "--modes-config",
+            type=str,
+            default=ServerArgs.modes_config,
+            help="Path to a reusable MoDES config containing alpha and tau_text.",
+        )
+        parser.add_argument(
+            "--modes-save-config",
+            type=str,
+            default=ServerArgs.modes_save_config,
+            help="Path to save the auto-calibrated MoDES runtime config.",
+        )
+        parser.add_argument(
+            "--modes-alpha-path",
+            type=str,
+            default=ServerArgs.modes_alpha_path,
+            help="Path to a JSON alpha list or object with an alpha list.",
+        )
+        parser.add_argument(
+            "--modes-tau-text",
+            type=float,
+            default=ServerArgs.modes_tau_text,
+            help="Fixed MoDES text threshold. If unset, auto tau calibration is used.",
+        )
+        parser.add_argument(
+            "--modes-target-skip-rate",
+            type=float,
+            default=ServerArgs.modes_target_skip_rate,
+            help="Target routed-slot skip rate for auto tau calibration.",
+        )
+        parser.add_argument(
+            "--modes-calibration-routes",
+            type=int,
+            default=ServerArgs.modes_calibration_routes,
+            help="Number of routed scores collected before auto alpha/tau are finalized.",
+        )
+        parser.add_argument(
+            "--modes-min-experts-per-token",
+            type=int,
+            default=ServerArgs.modes_min_experts_per_token,
+            help="Minimum routed experts kept per token after MoDES masking.",
+        )
+        parser.add_argument(
+            "--modes-metrics-path",
+            type=str,
+            default=ServerArgs.modes_metrics_path,
+            help="Optional JSON path for MoDES runtime metrics.",
+        )
+        parser.add_argument(
+            "--modes-metrics-flush-interval",
+            type=int,
+            default=ServerArgs.modes_metrics_flush_interval,
+            help="Number of MoE calls between MoDES metrics writes.",
+        )
+        parser.add_argument(
+            "--modes-alpha-min",
+            type=float,
+            default=ServerArgs.modes_alpha_min,
+            help="Lower clamp for auto alpha calibration.",
+        )
+        parser.add_argument(
+            "--modes-alpha-max",
+            type=float,
+            default=ServerArgs.modes_alpha_max,
+            help="Upper clamp for auto alpha calibration.",
+        )
+        parser.add_argument(
+            "--modes-disable-auto-alpha",
+            action="store_true",
+            default=ServerArgs.modes_disable_auto_alpha,
+            help="Disable MoDES auto alpha calibration.",
+        )
+        parser.add_argument(
+            "--modes-disable-auto-tau",
+            action="store_true",
+            default=ServerArgs.modes_disable_auto_tau,
+            help="Disable MoDES auto tau calibration.",
+        )
+        parser.add_argument(
+            "--modes-disable-force-standard-topk",
+            action="store_true",
+            default=ServerArgs.modes_disable_force_standard_topk,
+            help="Do not force standard top-k output tensors when MoDES is enabled.",
         )
 
         # Mamba Cache
